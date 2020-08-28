@@ -1,9 +1,27 @@
 defmodule Absinthe.Phoenix.ControllerTest do
   use ExUnit.Case, async: true
   use Absinthe.Phoenix.ConnCase
+  use Absinthe.Phoenix.ChannelCase
+
+  setup_all do
+    Absinthe.Test.prime(Schema)
+
+    children = [
+      {Phoenix.PubSub, [name: Absinthe.Phoenix.PubSub, adapter: Phoenix.PubSub.PG2]},
+      Absinthe.Phoenix.TestEndpoint,
+      {Absinthe.Subscription, Absinthe.Phoenix.TestEndpoint}
+    ]
+
+    {:ok, _} = Supervisor.start_link(children, strategy: :one_for_one)
+    :ok
+  end
 
   defmodule Schema do
     use Absinthe.Schema
+
+    object :mutation_result do
+      field :echo, :integer
+    end
 
     query do
       field :string, :string do
@@ -27,6 +45,21 @@ defmodule Absinthe.Phoenix.ControllerTest do
       end
     end
 
+    mutation do
+      field :update_integer, :mutation_result do
+        arg :echo, :integer
+        resolve &resolve_update_integer/3
+      end
+    end
+
+    subscription do
+      field :updated_integer, :mutation_result do
+        config(fn _, _ -> {:ok, topic: "*"} end)
+        trigger(:update_integer, topic: fn _ -> ["*"] end)
+        resolve(fn %{integer: integer}, _, _ -> {:ok, %{echo: integer}} end)
+      end
+    end
+
     object :deep_integers do
       field :foo, :integer
       field :bar, :integer
@@ -41,6 +74,10 @@ defmodule Absinthe.Phoenix.ControllerTest do
 
     def resolve_echo(_, %{echo: echo}, _) do
       {:ok, echo}
+    end
+
+    def resolve_update_integer(_, %{echo: echo}, _) do
+      {:ok, %{echo: echo}}
     end
   end
 
@@ -90,6 +127,16 @@ defmodule Absinthe.Phoenix.ControllerTest do
     query ($echo: DeepIntegersInput) { input_object_with_integers(echo: $echo) }
     """
     def input_object_with_integers(conn, %{data: data}), do: json(conn, data)
+
+    @graphql """
+    mutation UpdateInteger($echo: Int) {
+    update_integer(echo: $echo){
+    echo
+    }
+    }
+    """
+    def update_integer(conn, %{data: data}), do: json(conn, data)
+
   end
 
   describe "input" do
@@ -111,6 +158,25 @@ defmodule Absinthe.Phoenix.ControllerTest do
                result(Controller, :input_object_with_integers, %{
                  "echo" => %{"foo" => "1", "bar" => "2", "baz" => "3"}
                })
+    end
+
+    test "trigger subscription via controller mutation" do
+
+      {:ok, _, socket} =
+        socket(Absinthe.Phoenix.TestSocket, nil, absinthe: %{schema: Schema, opts: []})
+        |> subscribe_and_join(Absinthe.Phoenix.Channel, "__absinthe__:control")
+
+      ref =
+        Phoenix.ChannelTest.push(socket, "doc", %{
+              "query" => "subscription {updatedInteger { echo }}"
+                                 })
+
+      assert_reply(ref, :ok, %{subscriptionId: subscription_ref})
+
+      assert %{"update_integer" => %{"echo" => 1}} ==
+        result(Controller, :update_integer, %{"echo" => "1"})
+
+      assert_push("subscription:data", push)
     end
   end
 
